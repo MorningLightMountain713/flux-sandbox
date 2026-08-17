@@ -1,0 +1,119 @@
+name: Node CI
+
+# SANDBOX: Check Hash + Publish verbatim from RunOnFlux/flux fix/fluxhashes-publish-in-place
+# @ 4030b5df9, with the fluxhashes clone URL pointed at the sandbox.
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js 20
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20.x
+      - name: Check Hash
+        run: |
+          newhash=$(find ./ZelBack -type f -exec md5sum {} + | awk '{print $1}' | LC_ALL=C sort | md5sum | awk '{printf $1}')
+          echo $newhash
+          echo NEW_HASH=$newhash >> $GITHUB_ENV
+      # Publishes into fluxhashes in place.
+      #
+      # This previously pushed a directory containing only hashes.js into src/hashes/ using an
+      # action that deletes the destination directory before copying, so anything else kept there
+      # was removed on every build. Cloning and editing the file leaves the rest of the directory
+      # alone.
+      #
+      # Each attempt re-syncs to origin/master before deciding, so it is idempotent and safe when
+      # two builds publish at once: the loser of a push race re-reads, finds the list already moved
+      # on, and either adds its hash to the new tip or exits because nothing is left to change.
+      #
+      # Alongside the hash it records a provenance row -- date, commit, branch, tag -- in the same
+      # commit. The list itself is opaque md5s, and the commit that produced an entry can stop
+      # existing (a force-push, a branch deleted after merge), so the row is what makes an entry
+      # attributable later. A tag push finds its hash already listed and fills in the tag on the
+      # existing row.
+      - name: Publish the tree hash to fluxhashes
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        run: |
+          git clone --quiet "https://x-access-token:${API_TOKEN_GITHUB}@github.com/MorningLightMountain713/fluxhashes-sandbox.git" fluxhashes
+          cd fluxhashes
+          git config user.email runonfluxbot@gmail.com
+          git config user.name runonfluxbot
+
+          for attempt in 1 2 3; do
+            git fetch --quiet origin master
+            git reset --quiet --hard origin/master
+
+            if ! grep -q "'${NEW_HASH}'" src/hashes/hashes.js; then
+              sed -i "s/  ];/    '${NEW_HASH}',\n  ];/" src/hashes/hashes.js
+            fi
+
+            # Everything read from the environment inside a single-quoted script: in a double-quoted
+            # shell string the backticks and ${...} below would be the shell's, not node's.
+            #
+            # A row is only created, never rewritten -- a hash republished from another branch keeps
+            # its original attribution. The one later edit is a tag push filling in an empty tag.
+            node -e '
+              const fs = require("fs");
+              const FILE = "src/hashes/provenance.json";
+              const hash = process.env.NEW_HASH;
+              const isTag = process.env.GITHUB_REF_TYPE === "tag";
+              const record = fs.existsSync(FILE)
+                ? JSON.parse(fs.readFileSync(FILE, "utf8"))
+                : { hashes: {} };
+              if (!record.hashes) record.hashes = {};
+              const row = record.hashes[hash];
+              if (!row) {
+                record.hashes[hash] = {
+                  published: new Date().toISOString().slice(0, 10),
+                  commit: process.env.GITHUB_SHA,
+                  branch: isTag ? null : process.env.GITHUB_REF_NAME,
+                  tag: isTag ? process.env.GITHUB_REF_NAME : null,
+                };
+              } else if (isTag && !row.tag) {
+                row.tag = process.env.GITHUB_REF_NAME;
+              }
+              fs.writeFileSync(FILE, `${JSON.stringify(record, null, 2)}\n`);
+            '
+
+            # Refuse to publish files that will not load. The list is served by requiring it, so a
+            # malformed edit would take the endpoint down rather than merely publishing something
+            # odd; a malformed provenance record would take the signing run down.
+            node -e '
+              const expected = process.env.NEW_HASH;
+              const hashes = require("./src/hashes/hashes").getHashes();
+              if (!Array.isArray(hashes) || !hashes.every((h) => /^[0-9a-f]{32}$/.test(h))) {
+                throw new Error("hashes.js did not parse as a list of md5s");
+              }
+              if (!hashes.includes(expected)) {
+                throw new Error("the new hash is not in the patched file");
+              }
+              const record = JSON.parse(require("fs").readFileSync("src/hashes/provenance.json", "utf8"));
+              if (!record.hashes[expected]) {
+                throw new Error("the new hash has no provenance row");
+              }
+              console.log(`hashes.js holds ${hashes.length} entries`);
+            '
+
+            git add src/hashes/hashes.js src/hashes/provenance.json
+            if git diff --cached --quiet -- src/hashes/hashes.js src/hashes/provenance.json; then
+              echo "already published: ${NEW_HASH}"
+              exit 0
+            fi
+
+            git commit --quiet -m "Update from https://github.com/RunOnFlux/flux/commit/${GITHUB_SHA}" -- src/hashes/hashes.js src/hashes/provenance.json
+
+            if git push --quiet; then
+              echo "published ${NEW_HASH}"
+              exit 0
+            fi
+            echo "push raced with another build, retrying"
+          done
+
+          echo "could not publish ${NEW_HASH} after 3 attempts"
+          exit 1
+
