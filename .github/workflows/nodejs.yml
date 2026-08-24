@@ -39,7 +39,14 @@ jobs:
         env:
           API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
         run: |
-          git clone --quiet "https://x-access-token:${API_TOKEN_GITHUB}@github.com/MorningLightMountain713/fluxhashes-sandbox.git" fluxhashes
+          # The token stays off disk. A credentialed clone URL is written into .git/config, which
+          # sits in the workspace for the rest of the job -- through npm install and every install
+          # script the dependency tree runs. fluxhashes is public, so the clone needs no credential
+          # at all and only the push carries one. One variable names the destination, so pointing a
+          # rehearsal at a sandbox copy is a single edit.
+          dest_repo=github.com/MorningLightMountain713/fluxhashes-sandbox.git
+
+          git clone --quiet "https://${dest_repo}" fluxhashes
           cd fluxhashes
           git config user.email runonfluxbot@gmail.com
           git config user.name runonfluxbot
@@ -107,7 +114,7 @@ jobs:
 
             git commit --quiet -m "Update from https://github.com/RunOnFlux/flux/commit/${GITHUB_SHA}" -- src/hashes/hashes.js src/hashes/provenance.json
 
-            if git push --quiet; then
+            if git push --quiet "https://x-access-token:${API_TOKEN_GITHUB}@${dest_repo}" HEAD:master; then
               echo "published ${NEW_HASH}"
               exit 0
             fi
@@ -117,3 +124,23 @@ jobs:
           echo "could not publish ${NEW_HASH} after 3 attempts"
           exit 1
 
+      # SANDBOX-ONLY. Measures in a real runner what the change claims: the credential does not
+      # survive the publish step anywhere on disk.
+      - name: Assert no credential left on disk
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        run: |
+          echo "--- fluxhashes remote as git recorded it ---"
+          git -C "$GITHUB_WORKSPACE/fluxhashes" remote -v
+
+          if grep -q "x-access-token" "$GITHUB_WORKSPACE/fluxhashes/.git/config"; then
+            echo "FAIL: a credentialed URL persisted in the clone config"
+            exit 1
+          fi
+          echo "PASS: no credentialed URL in the clone config"
+
+          if grep -rIlF -- "${API_TOKEN_GITHUB}" "$GITHUB_WORKSPACE" 2>/dev/null; then
+            echo "FAIL: the token value is present in the workspace (files listed above)"
+            exit 1
+          fi
+          echo "PASS: token value absent from the entire workspace"
